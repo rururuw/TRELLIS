@@ -6,16 +6,19 @@ os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default
 
 import imageio
 from trellis.pipelines import TrellisTextTo3DPipeline
+from trellis.pipelines import TrellisTextTo3DPipelineLoRA
 from trellis.utils import render_utils, postprocessing_utils
 
 # Load a pipeline from a model folder or a Hugging Face model hub.
-pipeline = TrellisTextTo3DPipeline.from_pretrained("microsoft/TRELLIS-text-xlarge")
+pipeline = TrellisTextTo3DPipelineLoRA.from_pretrained("microsoft/TRELLIS-text-large")
+print("!!! Slat sampler used:", pipeline.slat_sampler)
 pipeline.cuda()
 
 # Run the pipeline
 outputs = pipeline.run(
-    "A chair looking like a avocado.",
-    seed=1,
+    # "A chair looking like a avocado.",
+    "A living room layout with a table, a chair, and a sofa, 4k quality.",
+    seed=3,
     # Optional parameters
     # sparse_structure_sampler_params={
     #     "steps": 12,

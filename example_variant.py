@@ -15,12 +15,12 @@ pipeline = TrellisTextTo3DPipeline.from_pretrained("microsoft/TRELLIS-text-xlarg
 pipeline.cuda()
 
 # Load mesh to make variants
-base_mesh = o3d.io.read_triangle_mesh("assets/T.ply")
+base_mesh = o3d.io.read_triangle_mesh("assets/example_sofa/a_blue_sofa.ply")
 
 # Run the pipeline
 outputs = pipeline.run_variant(
     base_mesh,
-    "Rugged, metallic texture with orange and white paint finish, suggesting a durable, industrial feel.",
+    "make the arm rest sturdy and durable and made of metal.",
     seed=1,
     # Optional parameters
     # slat_sampler_params={
@@ -37,5 +37,5 @@ outputs = pipeline.run_variant(
 video_gs = render_utils.render_video(outputs['gaussian'][0])['color']
 video_mesh = render_utils.render_video(outputs['mesh'][0])['normal']
 video = [np.concatenate([frame_gs, frame_mesh], axis=1) for frame_gs, frame_mesh in zip(video_gs, video_mesh)]
-imageio.mimsave("sample_variant.mp4", video, fps=30)
+imageio.mimsave("sofa_local_editing.mp4", video, fps=30)
 

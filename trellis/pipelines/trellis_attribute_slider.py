@@ -8,8 +8,9 @@ from .base import Pipeline
 from . import samplers
 from ..modules import sparse as sp
 
+from .samplers.flow_euler import FlowEulerSamplerAttributeSlider
 
-class TrellisTextTo3DPipeline(Pipeline):
+class TrellisAttributeSliderPipeline(Pipeline):
     """
     Pipeline for inferring Trellis text-to-3D models.
 
@@ -39,28 +40,23 @@ class TrellisTextTo3DPipeline(Pipeline):
         self._init_text_cond_model(text_cond_model)
 
     @staticmethod
-    def from_pretrained(path: str) -> "TrellisTextTo3DPipeline":
+    def from_pretrained(path: str) -> "TrellisAttributeSliderPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
         """
-        pipeline = super(TrellisTextTo3DPipeline, TrellisTextTo3DPipeline).from_pretrained(path)
-        new_pipeline = TrellisTextTo3DPipeline()
+        pipeline = super(TrellisAttributeSliderPipeline, TrellisAttributeSliderPipeline).from_pretrained(path)
+        new_pipeline = TrellisAttributeSliderPipeline()
         new_pipeline.__dict__ = pipeline.__dict__
         args = pipeline._pretrained_args
 
         new_pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
         new_pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']
 
-        # see what are args['slat_sampler']['args']
-        print("!!! Slat sampler all:", args['slat_sampler'])
-        new_pipeline.slat_sampler = getattr(samplers, args['slat_sampler']['name'])(**args['slat_sampler']['args'])
+        new_pipeline.slat_sampler = FlowEulerSamplerAttributeSlider(**args['slat_sampler']['args'])
         new_pipeline.slat_sampler_params = args['slat_sampler']['params']
-        # here new_pipeline.slat_sampler_params is not really used
-        # print("!!! Slat sampler used:", new_pipeline.slat_sampler)
-        # print("!!! Slat sampler params:", new_pipeline.slat_sampler_params)
 
         new_pipeline.slat_normalization = args['slat_normalization']
 
@@ -94,24 +90,69 @@ class TrellisTextTo3DPipeline(Pipeline):
         embeddings = self.text_cond_model['model'](input_ids=tokens).last_hidden_state
         
         return embeddings
-        
-    def get_cond(self, prompt: List[str], neg_prompt: List[str] = None) -> dict:
+    
+
+    def get_cond(self, prompt: str, neg_prompt: str = None) -> dict:
         """
         Get the conditioning information for the model.
 
         Args:
-            prompt (List[str]): The text prompt.
+            prompt (str): The text prompt.
 
         Returns:
             dict: The conditioning information
         """
-        cond = self.encode_text(prompt)
+        cond = self.encode_text([prompt]) # make sure encode_text is called with a list of a single string
         # neg_cond = self.text_cond_model['null_cond']
-        neg_cond = self.text_cond_model['null_cond'] if neg_prompt is None else self.encode_text(neg_prompt)
+        neg_cond = self.text_cond_model['null_cond'] if neg_prompt is None else self.encode_text([neg_prompt]) # make sure encode_text is called with a list of a single string
         return {
             'cond': cond,
             'neg_cond': neg_cond,
+            'neutral_cond': None,
+            'other_conds_mix_pos': None,
+            'other_conds_mix_neg': None,
         }
+    
+    def mix_cond(self, neutral_prompt: str, positive_prompt: str, neg_prompt: str = None, other_prompts: List[str] = None) -> dict:
+        """
+        Mix the conditioning information for the model.
+
+        Args:
+            neutral_prompt (str): The neutral prompt. a single string
+            positive_prompt (str): The positive prompt. a single string
+            neg_prompt (str): The negative prompt. a single string
+            other_prompts (List[str]): The other attributes that are irrelevant to the positive prompt. a list of strings, each string is a single prompt
+
+        Returns:
+            dict: The conditioning information
+        """
+        # mixing pos cond with neutral cond
+        pos_cond = self.encode_text([neutral_prompt + ", " + positive_prompt])
+        neg_cond = self.encode_text([neutral_prompt + ", " + neg_prompt])
+        neutral_cond = self.encode_text([neutral_prompt])
+        empty_cond = self.text_cond_model['null_cond']
+        return {
+            'cond': pos_cond,
+            'neg_cond': neg_cond,
+            'neutral_cond': neutral_cond,
+            'empty_cond': empty_cond,
+            # 'other_conds_mix_pos': None,
+            # 'other_conds_mix_neg': None,
+        }
+        # other_conds_mix_pos = [con  for con in other_prompts] if other_prompts is not None else []
+        # other_conds_mix_pos = [self.encode_text([con]) for con in other_conds_mix_pos] # make sure encode_text is called with a list of a single string
+        # neu_cond = self.encode_text([neutral_prompt]) # neutral_prompt
+        # other_conds_mix_neg = [con + ", " + neg_prompt for con in other_prompts] if other_prompts is not None else []
+        # other_conds_mix_neg = [self.encode_text([con]) for con in other_conds_mix_neg] # make sure encode_text is called with a list of a single string
+
+        # return {
+        #     'cond': None,
+        #     'neg_cond': None,
+        #     # added for attribute slider
+        #     'neutral_cond': neu_cond,
+        #     'other_conds_mix_pos': other_conds_mix_pos,
+        #     'other_conds_mix_neg': other_conds_mix_neg,
+        # }
 
     def sample_sparse_structure(
         self,
@@ -175,6 +216,7 @@ class TrellisTextTo3DPipeline(Pipeline):
         cond: dict,
         coords: torch.Tensor,
         sampler_params: dict = {},
+        slider_scale: float = 1.0,
     ) -> sp.SparseTensor:
         """
         Sample structured latent with the given conditioning.
@@ -196,7 +238,8 @@ class TrellisTextTo3DPipeline(Pipeline):
             noise,
             **cond,
             **sampler_params,
-            verbose=True
+            verbose=True,
+            slider_scale=slider_scale,
         ).samples
 
         std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)
@@ -208,13 +251,15 @@ class TrellisTextTo3DPipeline(Pipeline):
     @torch.no_grad()
     def run(
         self,
-        prompt: str,
+        prompt: str,    # positive prompt
         num_samples: int = 1,
         seed: int = 42,
         sparse_structure_sampler_params: dict = {},
         slat_sampler_params: dict = {},
         formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
-        neg_prompt: str = None,
+        # neg_prompt: str = None,
+        # neutral_prompt: str = None,
+        # other_prompts: List[str] = None,
     ) -> dict:
         """
         Run the pipeline.
@@ -227,7 +272,7 @@ class TrellisTextTo3DPipeline(Pipeline):
             slat_sampler_params (dict): Additional parameters for the structured latent sampler.
             formats (List[str]): The formats to decode the structured latent to.
         """
-        cond = self.get_cond([prompt], [neg_prompt] if neg_prompt is not None else None)
+        cond = self.get_cond(prompt) # only a single prompt is given, neutral cond
         torch.manual_seed(seed)
         coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
         slat = self.sample_slat(cond, coords, slat_sampler_params)
@@ -272,6 +317,9 @@ class TrellisTextTo3DPipeline(Pipeline):
         slat_sampler_params: dict = {},
         formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
         neg_prompt: str = None,
+        neutral_prompt: str = None,
+        slider_scale: float = 1.0,
+        other_prompts: List[str] = None,
     ) -> dict:
         """
         Run the pipeline for making variants of an asset.
@@ -283,13 +331,16 @@ class TrellisTextTo3DPipeline(Pipeline):
             seed (int): The random seed
             slat_sampler_params (dict): Additional parameters for the structured latent sampler.
             formats (List[str]): The formats to decode the structured latent to.
+            neg_prompt (str): The negative prompt.
+            neutral_prompt (str): The neutral prompt.
+            other_prompts (List[str]): The other attributes that are irrelevant to the positive prompt. a list of strings, each string is a single prompt
         """
-        cond = self.get_cond([prompt], [neg_prompt] if neg_prompt is not None else None)
+        cond = self.mix_cond(neutral_prompt=neutral_prompt, positive_prompt=prompt, neg_prompt=neg_prompt)
         coords = self.voxelize(mesh)
         coords = torch.cat([
             torch.arange(num_samples).repeat_interleave(coords.shape[0], 0)[:, None].int().cuda(),
             coords.repeat(num_samples, 1)
         ], 1)
         torch.manual_seed(seed)
-        slat = self.sample_slat(cond, coords, slat_sampler_params)
+        slat = self.sample_slat(cond, coords, slat_sampler_params, slider_scale)
         return self.decode_slat(slat, formats)

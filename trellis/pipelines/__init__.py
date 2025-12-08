@@ -1,7 +1,8 @@
 from . import samplers
 from .trellis_image_to_3d import TrellisImageTo3DPipeline
 from .trellis_text_to_3d import TrellisTextTo3DPipeline
-
+from .trellis_attribute_slider import TrellisAttributeSliderPipeline
+from .trellis_attribute_slider_with_image import TrellisImageTo3DAttributeSliderPipeline
 
 def from_pretrained(path: str):
     """
