@@ -54,6 +54,8 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
         
     bpy.context.preferences.addons['cycles'].preferences.get_devices()
     bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'CUDA'
+    for device in bpy.context.preferences.addons['cycles'].preferences.devices:
+        device.use = True
     
 def init_nodes(save_depth=False, save_normal=False, save_albedo=False, save_mist=False):
     if not any([save_depth, save_normal, save_albedo, save_mist]):

@@ -53,6 +53,7 @@ class TrellisTextTo3DPipeline(Pipeline):
 
         new_pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
         new_pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']
+        print('sparse structure sampler parameters: ', new_pipeline.sparse_structure_sampler_params)
 
         # see what are args['slat_sampler']['args']
         print("!!! Slat sampler all:", args['slat_sampler'])
@@ -230,6 +231,7 @@ class TrellisTextTo3DPipeline(Pipeline):
         cond = self.get_cond([prompt], [neg_prompt] if neg_prompt is not None else None)
         torch.manual_seed(seed)
         coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        # print('here in run(), coords shape:', coords.shape)
         slat = self.sample_slat(cond, coords, slat_sampler_params)
         return self.decode_slat(slat, formats)
     
@@ -293,3 +295,17 @@ class TrellisTextTo3DPipeline(Pipeline):
         torch.manual_seed(seed)
         slat = self.sample_slat(cond, coords, slat_sampler_params)
         return self.decode_slat(slat, formats)
+    
+    @torch.no_grad()
+    def run_w_slat(
+        self,
+        slat: sp.SparseTensor,
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+    ) -> dict:
+        """
+        Run the pipeline with a given SLAT.
+        """
+        # std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)
+        # mean = torch.tensor(self.slat_normalization['mean'])[None].to(slat.device)
+        # slat = slat * std + mean
+        return self.decode_slat(slat, formats) 

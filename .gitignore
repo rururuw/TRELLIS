@@ -400,3 +400,9 @@ FodyWeavers.xsd
 # results folder
 outputs/
 assets/
+
+# validation folder for now
+validation/
+
+# pipelines folder for now
+trellis/pipelines/latent_alter
