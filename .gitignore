@@ -402,7 +402,11 @@ outputs/
 assets/
 
 # validation folder for now
-validation/
+validation/archive
+validation/data
+validation/DSG
+# any hf_cache folder
+validation/exps/hf_cache/
 
 # pipelines folder for now
 trellis/pipelines/latent_alter
