@@ -309,3 +309,16 @@ class TrellisTextTo3DPipeline(Pipeline):
         # mean = torch.tensor(self.slat_normalization['mean'])[None].to(slat.device)
         # slat = slat * std + mean
         return self.decode_slat(slat, formats) 
+
+    @torch.no_grad()
+    def decode_ss_latent(
+        self,
+        ss_latent: torch.Tensor,
+    ) -> dict:
+        """
+        Decode a SS Latent.
+        """
+        decoder = self.models['sparse_structure_decoder']
+        coords = torch.argwhere(decoder(ss_latent)>0)[:, [0, 2, 3, 4]].int()
+
+        return coords

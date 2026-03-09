@@ -99,6 +99,12 @@ def render_video(sample, resolution=512, bg_color=(0, 0, 0), num_frames=300, r=2
     extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitch, r, fov)
     return render_frames(sample, extrinsics, intrinsics, {'resolution': resolution, 'bg_color': bg_color}, **kwargs)
 
+def render_key_frames(sample, resolution=512, bg_color=(0, 0, 0), num_frames=4, r=2, fov=40, **kwargs):
+    yaws = torch.arange(0, 2 * 3.1415, 2 * 3.1415 / num_frames)
+    yaws = yaws.tolist()
+    pitchs = [3.1415 / 6] * len(yaws)
+    extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, r, fov)
+    return render_frames(sample, extrinsics, intrinsics, {'resolution': resolution, 'bg_color': bg_color}, **kwargs)
 
 def render_multiview(sample, resolution=512, nviews=30):
     r = 2

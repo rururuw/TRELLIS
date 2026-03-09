@@ -33,7 +33,7 @@ EXT = {
     'TARGA': 'tga'
 }
 
-def init_render(engine='CYCLES', resolution=512, geo_mode=False):
+def init_render(engine='CYCLES', resolution=512, geo_mode=False, samples=None):
     bpy.context.scene.render.engine = engine
     bpy.context.scene.render.resolution_x = resolution
     bpy.context.scene.render.resolution_y = resolution
@@ -43,7 +43,11 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
     bpy.context.scene.render.film_transparent = True
     
     bpy.context.scene.cycles.device = 'GPU'
-    bpy.context.scene.cycles.samples = 128 if not geo_mode else 1
+    # Determine samples: explicit arg > geo_mode (1) > default (128)
+    if samples is not None:
+        bpy.context.scene.cycles.samples = samples
+    else:
+        bpy.context.scene.cycles.samples = 1 if geo_mode else 128
     bpy.context.scene.cycles.filter_type = 'BOX'
     bpy.context.scene.cycles.filter_width = 1
     bpy.context.scene.cycles.diffuse_bounces = 1
@@ -419,7 +423,7 @@ def main(arg):
     os.makedirs(arg.output_folder, exist_ok=True)
     
     # Initialize context
-    init_render(engine=arg.engine, resolution=arg.resolution, geo_mode=arg.geo_mode)
+    init_render(engine=arg.engine, resolution=arg.resolution, geo_mode=arg.geo_mode, samples=arg.samples)
     outputs, spec_nodes = init_nodes(
         save_depth=arg.save_depth,
         save_normal=arg.save_normal,
@@ -516,6 +520,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_folder', type=str, default='/tmp', help='The path the output will be dumped to.')
     parser.add_argument('--resolution', type=int, default=512, help='Resolution of the images.')
     parser.add_argument('--engine', type=str, default='CYCLES', help='Blender internal engine for rendering. E.g. CYCLES, BLENDER_EEVEE, ...')
+    parser.add_argument('--samples', type=int, default=None, help='Number of samples for CYCLES rendering. Overrides default (128).')
     parser.add_argument('--geo_mode', action='store_true', help='Geometry mode for rendering.')
     parser.add_argument('--save_depth', action='store_true', help='Save the depth maps.')
     parser.add_argument('--save_normal', action='store_true', help='Save the normal maps.')

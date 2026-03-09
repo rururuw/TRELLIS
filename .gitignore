@@ -406,3 +406,6 @@ validation/
 
 # pipelines folder for now
 trellis/pipelines/latent_alter
+
+# .env file
+.env

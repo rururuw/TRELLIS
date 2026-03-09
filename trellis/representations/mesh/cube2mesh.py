@@ -71,6 +71,13 @@ class SparseFeatures2Mesh:
         self.use_color = use_color
         self._calc_layout()
     
+    def to(self, device):
+        self.device = device
+        self.reg_v = self.reg_v.to(device)
+        self.reg_c = self.reg_c.to(device)
+        self.mesh_extractor.to(device)
+        return self
+
     def _calc_layout(self):
         LAYOUTS = {
             'sdf': {'shape': (8, 1), 'size': 8},

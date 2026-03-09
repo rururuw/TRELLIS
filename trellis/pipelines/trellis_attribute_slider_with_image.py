@@ -1,0 +1,683 @@
+from typing import *
+from contextlib import contextmanager
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torchvision import transforms
+from PIL import Image
+import rembg
+from .base import Pipeline
+from . import samplers
+from ..modules import sparse as sp
+import open3d as o3d
+from .samplers import FlowEulerSamplerAttributeSlider
+
+import os
+os.environ['SPCONV_ALGO'] = 'native'
+
+class TrellisImageTo3DAttributeSliderPipeline(Pipeline):
+    """
+    Pipeline for inferring Trellis image-to-3D attribute slider models.
+
+    Args:
+        models (dict[str, nn.Module]): The models to use in the pipeline.
+        sparse_structure_sampler (samplers.Sampler): The sampler for the sparse structure.
+        slat_sampler (samplers.Sampler): The sampler for the structured latent.
+        slat_normalization (dict): The normalization parameters for the structured latent.
+        image_cond_model (str): The name of the image conditioning model.
+    """
+    def __init__(
+        self,
+        models: dict[str, nn.Module] = None,
+        sparse_structure_sampler: samplers.Sampler = None,
+        slat_sampler: samplers.Sampler = None,
+        slat_normalization: dict = None,
+        image_cond_model: str = None,
+    ):
+        if models is None:
+            return
+        super().__init__(models)
+        self.sparse_structure_sampler = sparse_structure_sampler
+        self.slat_sampler = slat_sampler
+        self.sparse_structure_sampler_params = {}
+        self.slat_sampler_params = {}
+        self.slat_normalization = slat_normalization
+        self.rembg_session = None
+        self._init_image_cond_model(image_cond_model)
+
+    @staticmethod
+    def from_pretrained(path: str) -> "TrellisImageTo3DAttributeSliderPipeline":
+        """
+        Load a pretrained model.
+
+        Args:
+            path (str): The path to the model. Can be either local path or a Hugging Face repository.
+        """
+        pipeline = super(TrellisImageTo3DAttributeSliderPipeline, TrellisImageTo3DAttributeSliderPipeline).from_pretrained(path)
+        new_pipeline = TrellisImageTo3DAttributeSliderPipeline()
+        new_pipeline.__dict__ = pipeline.__dict__
+        args = pipeline._pretrained_args
+
+        new_pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
+        new_pipeline.sparse_structure_sampler = FlowEulerSamplerAttributeSlider(**args['sparse_structure_sampler']['args'])
+        new_pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']
+
+        # new_pipeline.slat_sampler = getattr(samplers, args['slat_sampler']['name'])(**args['slat_sampler']['args'])
+        # new_pipeline.slat_sampler_params = args['slat_sampler']['params']
+
+        new_pipeline.slat_sampler = FlowEulerSamplerAttributeSlider(**args['slat_sampler']['args'])
+        new_pipeline.slat_sampler_params = args['slat_sampler']['params']
+
+        new_pipeline.slat_normalization = args['slat_normalization']
+
+        new_pipeline._init_image_cond_model(args['image_cond_model'])
+
+        return new_pipeline
+    
+    def _init_image_cond_model(self, name: str):
+        """
+        Initialize the image conditioning model.
+        """
+        dinov2_model = torch.hub.load('facebookresearch/dinov2', name, pretrained=True)
+        dinov2_model.eval()
+        self.models['image_cond_model'] = dinov2_model
+        transform = transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        self.image_cond_model_transform = transform
+
+    def preprocess_image(self, input: Image.Image) -> Image.Image:
+        """
+        Preprocess the input image.
+        """
+        # if has alpha channel, use it directly; otherwise, remove background
+        has_alpha = False
+        if input.mode == 'RGBA':
+            alpha = np.array(input)[:, :, 3]
+            if not np.all(alpha == 255):
+                has_alpha = True
+        if has_alpha:
+            output = input
+        else:
+            input = input.convert('RGB')
+            max_size = max(input.size)
+            scale = min(1, 1024 / max_size)
+            if scale < 1:
+                input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
+            if getattr(self, 'rembg_session', None) is None:
+                self.rembg_session = rembg.new_session('u2net')
+            output = rembg.remove(input, session=self.rembg_session)
+        output_np = np.array(output)
+        alpha = output_np[:, :, 3]
+        bbox = np.argwhere(alpha > 0.8 * 255)
+        bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
+        center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        size = int(size * 1.2)
+        bbox = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
+        output = output.crop(bbox)  # type: ignore
+        output = output.resize((518, 518), Image.Resampling.LANCZOS)
+        output = np.array(output).astype(np.float32) / 255
+        output = output[:, :, :3] * output[:, :, 3:4]
+        output = Image.fromarray((output * 255).astype(np.uint8))
+        return output
+
+    @torch.no_grad()
+    def encode_image(self, image: Union[torch.Tensor, list[Image.Image]]) -> torch.Tensor:
+        """
+        Encode the image.
+
+        Args:
+            image (Union[torch.Tensor, list[Image.Image]]): The image to encode
+
+        Returns:
+            torch.Tensor: The encoded features.
+        """
+        if isinstance(image, torch.Tensor):
+            assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
+        elif isinstance(image, list):
+            assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
+            image = [i.resize((518, 518), Image.LANCZOS) for i in image]
+            image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
+            image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
+            image = torch.stack(image).to(self.device)
+        else:
+            raise ValueError(f"Unsupported type of image: {type(image)}")
+        
+        image = self.image_cond_model_transform(image).to(self.device)
+        features = self.models['image_cond_model'](image, is_training=True)['x_prenorm']
+        patchtokens = F.layer_norm(features, features.shape[-1:])
+        return patchtokens
+        
+    def get_cond(self, image: Union[torch.Tensor, list[Image.Image]]) -> dict:
+        """
+        Get the conditioning information for the model.
+
+        Args:
+            image (Union[torch.Tensor, list[Image.Image]]): The image prompts.
+
+        Returns:
+            dict: The conditioning information
+        """
+        cond = self.encode_image(image)
+        neg_cond = torch.zeros_like(cond)
+        return {
+            'cond': cond,
+            'neg_cond': neg_cond,
+        }
+    
+
+    def sample_sparse_structure(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        sampler_params: dict = {},
+        slider_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Sample sparse structures with the given conditioning.
+        
+        Args:
+            cond (dict): The conditioning information.
+            num_samples (int): The number of samples to generate.
+            sampler_params (dict): Additional parameters for the sampler.
+        """
+        # Sample occupancy latent
+        flow_model = self.models['sparse_structure_flow_model']
+        reso = flow_model.resolution
+        noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)
+        sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
+        z_s = self.sparse_structure_sampler.sample(
+            flow_model,
+            noise,
+            **cond,
+            **sampler_params,
+            verbose=True,
+            slider_scale=slider_scale,
+        ).samples
+        
+        # Decode occupancy latent
+        decoder = self.models['sparse_structure_decoder']
+        coords = torch.argwhere(decoder(z_s)>0)[:, [0, 2, 3, 4]].int()
+
+        return coords
+
+    
+    def decode_slat(
+        self,
+        slat: sp.SparseTensor,
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+    ) -> dict:
+        """
+        Decode the structured latent.
+
+        Args:
+            slat (sp.SparseTensor): The structured latent.
+            formats (List[str]): The formats to decode the structured latent to.
+
+        Returns:
+            dict: The decoded structured latent.
+        """
+        ret = {}
+        if 'mesh' in formats:
+            ret['mesh'] = self.models['slat_decoder_mesh'](slat)
+        if 'gaussian' in formats:
+            ret['gaussian'] = self.models['slat_decoder_gs'](slat)
+        if 'radiance_field' in formats:
+            ret['radiance_field'] = self.models['slat_decoder_rf'](slat)
+        return ret
+    
+    def sample_slat(
+        self,
+        cond: dict,
+        coords: torch.Tensor,
+        sampler_params: dict = {},
+        slider_scale: float = 1.0,
+    ) -> sp.SparseTensor:
+        """
+        Sample structured latent with the given conditioning.
+        
+        Args:
+            cond (dict): The conditioning information.
+            coords (torch.Tensor): The coordinates of the sparse structure.
+            sampler_params (dict): Additional parameters for the sampler.
+        """
+        # Sample structured latent
+        flow_model = self.models['slat_flow_model']
+        flow_model.to(self.device)
+        noise = sp.SparseTensor(
+            feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
+            coords=coords.to(self.device),
+        )
+        sampler_params = {**self.slat_sampler_params, **sampler_params}
+        slat = self.slat_sampler.sample(
+            flow_model,
+            noise,
+            **cond,
+            **sampler_params,
+            verbose=True,
+            slider_scale=slider_scale,
+        ).samples
+
+        std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)
+        mean = torch.tensor(self.slat_normalization['mean'])[None].to(slat.device)
+        slat = slat * std + mean
+        
+        return slat
+
+    @torch.no_grad()
+    def run(
+        self,
+        image: Image.Image,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        preprocess_image: bool = True,
+    ) -> dict:
+        """
+        Run the pipeline.
+
+        Args:
+            image (Image.Image): The image prompt.
+            num_samples (int): The number of samples to generate.
+            seed (int): The random seed.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            formats (List[str]): The formats to decode the structured latent to.
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        if preprocess_image:
+            image = self.preprocess_image(image)
+        cond = self.get_cond([image])
+        torch.manual_seed(seed)
+        coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        slat = self.sample_slat(cond, coords, slat_sampler_params)
+        return self.decode_slat(slat, formats)
+
+    @staticmethod
+    def _replicate_for_batch(x_t, n):
+        """Replicate x_t n times along the batch dimension."""
+        if isinstance(x_t, sp.SparseTensor):
+            feats = x_t.feats.repeat(n, *([1] * (x_t.feats.dim() - 1)))
+            coords = x_t.coords.repeat(n, 1)
+            batch_size_per = x_t.shape[0]
+            offsets = torch.arange(n, device=coords.device).repeat_interleave(x_t.coords.shape[0])
+            coords[:, 0] = coords[:, 0] + offsets * batch_size_per
+            return sp.SparseTensor(feats=feats, coords=coords)
+        return x_t.repeat(n, *([1] * (x_t.dim() - 1)))
+
+    @staticmethod
+    def _sum_batched_output(pred, n):
+        """Sum n batched predictions back to original batch size."""
+        if isinstance(pred, sp.SparseTensor):
+            feats = pred.feats
+            pts_per_copy = feats.shape[0] // n
+            feats = feats.view(n, pts_per_copy, *feats.shape[1:]).sum(dim=0)
+            coords = pred.coords[:pts_per_copy]
+            return sp.SparseTensor(feats=feats, coords=coords)
+        orig_batch = pred.shape[0] // n
+        return pred.view(n, orig_batch, *pred.shape[1:]).sum(dim=0)
+
+    @contextmanager
+    def inject_sampler_multi_image(
+        self,
+        sampler_name: str,
+        num_images: int,
+        num_steps: int,
+        mode: Literal['stochastic', 'multidiffusion', 'reconstruct_edit'] = 'stochastic',
+    ):
+        """
+        Inject a sampler with multiple images as condition.
+        
+        Args:
+            sampler_name (str): The name of the sampler to inject.
+            num_images (int): The number of images to condition on.
+            num_steps (int): The number of steps to run the sampler for.
+        """
+        sampler = getattr(self, sampler_name)
+        setattr(sampler, f'_old_inference_model', sampler._inference_model)
+
+        if mode == 'stochastic':
+            if num_images > num_steps:
+                print(f"\033[93mWarning: number of conditioning images is greater than number of steps for {sampler_name}. "
+                    "This may lead to performance degradation.\033[0m")
+
+            cond_indices = (np.arange(num_steps) % num_images).tolist()
+            def _new_inference_model(self, model, x_t, t, cond, **kwargs):
+                cond_idx = cond_indices.pop(0)
+                cond_i = cond[cond_idx:cond_idx+1]
+                return self._old_inference_model(model, x_t, t, cond=cond_i, **kwargs)
+        
+        elif mode =='multidiffusion':
+            from .samplers import FlowEulerSampler
+            def _new_inference_model(self, model, x_t, t, cond, neg_cond, cfg_strength, cfg_interval, **kwargs):
+                if cfg_interval[0] <= t <= cfg_interval[1]:
+                    preds = []
+                    for i in range(len(cond)):
+                        preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                    pred = sum(preds) / len(preds)
+                    neg_pred = FlowEulerSampler._inference_model(self, model, x_t, t, neg_cond, **kwargs)
+                    return (1 + cfg_strength) * pred - cfg_strength * neg_pred
+                else:
+                    preds = []
+                    for i in range(len(cond)):
+                        preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                    pred = sum(preds) / len(preds)
+                    return pred
+            
+        elif mode == 'reconstruct_edit':
+            from .samplers import FlowEulerSamplerAttributeSlider
+            def _new_inference_model(self, model, x_t, t, cond, **kwargs):
+                preds = []
+                for i in range(len(cond)):
+                    preds.append(FlowEulerSamplerAttributeSlider._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                pred = sum(preds) / len(preds)
+                return pred
+            
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+            
+        sampler._inference_model = _new_inference_model.__get__(sampler, type(sampler))
+
+        yield
+
+        sampler._inference_model = sampler._old_inference_model
+        delattr(sampler, f'_old_inference_model')
+
+    @contextmanager
+    def inject_sampler_multi_image_recon_edit_parallel(
+        self,
+        sampler_name: str,
+        parallel: Literal['batch', 'multi_gpu'] = 'batch',
+        gpu_ids: Optional[List[int]] = None,
+        batch_size_per_gpu: Optional[int] = None,
+    ):
+        """
+        Like :meth:`inject_sampler_multi_image` but runs conditions in parallel.
+
+        Args:
+            sampler_name (str): The name of the sampler to inject.
+            parallel (str): Parallelism strategy:
+                - ``'batch'``: batch all conditions into one forward pass on a
+                  single GPU.  Use *batch_size_per_gpu* to control how many
+                  conditions are batched per forward pass.
+                - ``'multi_gpu'``: place a model copy on each GPU and iterate
+                  over GPUs sequentially.  Each GPU's conditions are batched
+                  (controlled by *batch_size_per_gpu*).
+            gpu_ids (list[int], optional): GPU device ids for ``'multi_gpu'`` mode.
+                Defaults to all visible CUDA devices.
+            batch_size_per_gpu (int, optional): Max number of conditions to process
+                per GPU in one forward pass.  When ``None`` (default), all conditions
+                assigned to a GPU are processed at once.  When set, each GPU processes
+                at most this many conditions per iteration and loops over the rest.
+                Use this to cap VRAM usage.
+        """
+        sampler = getattr(self, sampler_name)
+        setattr(sampler, '_old_inference_model', sampler._inference_model)
+        pipeline = self
+
+        from .samplers import FlowEulerSamplerAttributeSlider
+
+        if parallel == 'batch':
+            def _new_inference_model(self, model, x_t, t, cond, **kwargs):
+                n = len(cond)
+                m = batch_size_per_gpu or n
+                total = None
+                for start in range(0, n, m):
+                    sub = cond[start:start + m]
+                    k = sub.shape[0]
+                    x_b = pipeline._replicate_for_batch(x_t, k)
+                    p = FlowEulerSamplerAttributeSlider._inference_model(
+                        self, model, x_b, t, sub, **kwargs)
+                    chunk_sum = pipeline._sum_batched_output(p, k)
+                    total = chunk_sum if total is None else total + chunk_sum
+                return total / n
+
+        else:  # multi_gpu
+            devices = [torch.device(f'cuda:{i}') for i in (gpu_ids or range(torch.cuda.device_count()))]
+            def _new_inference_model(self, model, x_t, t, cond, **kwargs):
+                n = len(cond)
+                m = batch_size_per_gpu or n
+                per_gpu = [cond[i::len(devices)] for i in range(len(devices))]
+                total = None
+                for dev, gpu_cond in zip(devices, per_gpu):
+                    if gpu_cond.shape[0] == 0:
+                        continue
+                    for start in range(0, gpu_cond.shape[0], m):
+                        sub = gpu_cond[start:start + m].to(dev)
+                        k = sub.shape[0]
+                        x_b = pipeline._replicate_for_batch(x_t.to(dev), k)
+                        p = FlowEulerSamplerAttributeSlider._inference_model(
+                            self, model.to(dev), x_b, t, sub, **kwargs)
+                        chunk_sum = pipeline._sum_batched_output(p, k).to(x_t.device)
+                        total = chunk_sum if total is None else total + chunk_sum
+                return total / n
+
+        sampler._inference_model = _new_inference_model.__get__(sampler, type(sampler))
+
+        yield
+
+        sampler._inference_model = sampler._old_inference_model
+        delattr(sampler, '_old_inference_model')
+
+    @torch.no_grad()
+    def run_multi_image(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        preprocess_image: bool = True,
+        mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
+    ) -> dict:
+        """
+        Run the pipeline with multiple images as condition
+
+        Args:
+            images (List[Image.Image]): The multi-view images of the assets
+            num_samples (int): The number of samples to generate.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        if preprocess_image:
+            images = [self.preprocess_image(image) for image in images]
+        cond = self.get_cond(images)
+        cond['neg_cond'] = cond['neg_cond'][:1]
+        torch.manual_seed(seed)
+        ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode=mode):
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        slat_steps = {**self.slat_sampler_params, **slat_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('slat_sampler', len(images), slat_steps, mode=mode):
+            slat = self.sample_slat(cond, coords, slat_sampler_params)
+        return self.decode_slat(slat, formats)
+    
+    def get_reconstruct_edit_cond(self, images: List[Image.Image], positive_images: List[Image.Image], negative_images: List[Image.Image]) -> dict:
+        """
+        Get the conditioning information for the reconstruct edit model.
+        """
+        # preprocess images
+        images = [self.preprocess_image(image) for image in images]
+        positive_images = [self.preprocess_image(image) for image in positive_images]
+        negative_images = [self.preprocess_image(image) for image in negative_images]
+        # encode images
+        neutral_cond = self.encode_image(images) 
+        positive_cond = self.encode_image(positive_images) #.mean(dim=0, keepdim=True) # experiment 1/23 average on dim0 does not work well
+        negative_cond = self.encode_image(negative_images) #.mean(dim=0, keepdim=True)
+        empty_cond = torch.zeros_like(positive_cond)
+        empty_cond = empty_cond[:1]
+        return {
+            'neutral_cond': neutral_cond,
+            'cond': positive_cond,
+            'neg_cond': negative_cond,
+            'empty_cond': empty_cond,
+        }
+
+
+    @torch.no_grad()
+    def run_reconstruct_edit(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        mode: Literal['stochastic', 'multidiffusion', 'reconstruct_edit'] = 'reconstruct_edit',
+        slider_scale: float = 1.0,
+    ) -> dict:
+        """
+        Run the pipeline with multiple images as condition
+
+        Args:
+            cond (dict): The conditioning information. REQUIRED.
+            num_samples (int): The number of samples to generate.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        assert cond is not None, "Condition dictionary is required"
+        torch.manual_seed(seed)
+        with self.inject_sampler_multi_image('sparse_structure_sampler', -1, -1, mode=mode):
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params, slider_scale)
+        with self.inject_sampler_multi_image('slat_sampler', -1, -1, mode=mode):
+            slat = self.sample_slat(cond, coords, slat_sampler_params, slider_scale)
+        return self.decode_slat(slat, formats)
+    
+    @torch.no_grad()
+    def run_reconstruct_edit_parallel(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        slider_scale: float = 1.0,
+        ss_parallel: Literal['batch', 'multi_gpu'] = 'batch',
+        slat_parallel: Literal['batch', 'multi_gpu'] = 'batch',
+        gpu_ids: Optional[List[int]] = None,
+        ss_batch_size_per_gpu: Optional[int] = None,
+        slat_batch_size_per_gpu: Optional[int] = None,
+    ) -> dict:
+        """
+        Run the pipeline with multiple images as condition.
+
+        Args:
+            cond (dict): The conditioning information. REQUIRED.
+            num_samples (int): The number of samples to generate.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            slider_scale (float): The scale of the slider.
+            ss_parallel (str): Parallelism strategy for the sparse structure sampler.
+            slat_parallel (str): Parallelism strategy for the slat sampler.
+            gpu_ids (list[int], optional): GPU device ids for ``'multi_gpu'`` mode.
+            ss_batch_size_per_gpu (int, optional): Batch size per GPU for sparse structure sampling.
+            slat_batch_size_per_gpu (int, optional): Batch size per GPU for slat sampling.
+        """
+        assert cond is not None, "Condition dictionary is required"
+        torch.manual_seed(seed)
+        with self.inject_sampler_multi_image_recon_edit_parallel('sparse_structure_sampler', parallel=ss_parallel, gpu_ids=gpu_ids, batch_size_per_gpu=ss_batch_size_per_gpu):
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params, slider_scale)
+        with self.inject_sampler_multi_image_recon_edit_parallel('slat_sampler', parallel=slat_parallel, gpu_ids=gpu_ids, batch_size_per_gpu=slat_batch_size_per_gpu):
+            slat = self.sample_slat(cond, coords, slat_sampler_params, slider_scale)
+        return self.decode_slat(slat, formats)
+
+    def voxelize(self, mesh: o3d.geometry.TriangleMesh) -> torch.Tensor:
+        """
+        Voxelize a mesh.
+
+        Args:
+            mesh (o3d.geometry.TriangleMesh): The mesh to voxelize.
+            sha256 (str): The SHA256 hash of the mesh.
+            output_dir (str): The output directory.
+        """
+        vertices = np.asarray(mesh.vertices)
+        aabb = np.stack([vertices.min(0), vertices.max(0)])
+        center = (aabb[0] + aabb[1]) / 2
+        scale = (aabb[1] - aabb[0]).max()
+        vertices = (vertices - center) / scale
+        vertices = np.clip(vertices, -0.5 + 1e-6, 0.5 - 1e-6)
+        mesh.vertices = o3d.utility.Vector3dVector(vertices)
+        # voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(mesh, voxel_size=1/64, min_bound=(-0.5, -0.5, -0.5), max_bound=(0.5, 0.5, 0.5))
+        # vertices = np.array([voxel.grid_index for voxel in voxel_grid.get_voxels()])
+        # return torch.tensor(vertices).int().cuda()
+
+        # Fixed: use create_from_triangle_mesh instead of create_from_triangle_mesh_within_bounds
+        # to avoid segmentation fault with Open3D 0.17.0 on non-watertight meshes
+        voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh(mesh, voxel_size=1/64)
+        voxel_indices = np.array([voxel.grid_index for voxel in voxel_grid.get_voxels()])
+        # Filter voxels to be within the expected bounds [0, 63] in each dimension
+        valid_mask = np.all((voxel_indices >= 0) & (voxel_indices < 64), axis=1)
+        voxel_indices = voxel_indices[valid_mask]
+        return torch.tensor(voxel_indices).int().cuda()
+    
+    def mix_cond(self, positive_image: Image.Image, negative_image: Image.Image = None, neutral_image: Image.Image = None) -> dict:
+        """
+        Get the conditioning information for the model.
+
+        Args:
+            image (Union[torch.Tensor, list[Image.Image]]): The image prompts.
+
+        Returns:
+            dict: The conditioning information
+        """
+        pos_cond = self.encode_image([positive_image])
+        neg_cond = self.encode_image([negative_image])
+        neutral_cond = self.encode_image([neutral_image])
+        empty_cond = torch.zeros_like(pos_cond)
+        return {
+            'cond': pos_cond,
+            'neg_cond': neg_cond,
+            'neutral_cond': neutral_cond,
+            'empty_cond': empty_cond,
+        }
+    
+    
+    @torch.no_grad()
+    def run_variant(
+        self,
+        mesh: o3d.geometry.TriangleMesh,
+        positive_image: Image.Image,
+        negative_image: Image.Image = None,
+        neutral_image: Image.Image = None,
+        num_samples: int = 1,
+        seed: int = 42,
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        
+        slider_scale: float = 1.0,
+    ) -> dict:
+        """
+        Run the pipeline for making variants of an asset.
+
+        Args:
+            mesh (o3d.geometry.TriangleMesh): The base mesh.
+            prompt (str): The text prompt.
+            num_samples (int): The number of samples to generate.
+            seed (int): The random seed
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            formats (List[str]): The formats to decode the structured latent to.
+            neg_prompt (str): The negative prompt.
+            neutral_prompt (str): The neutral prompt.
+            other_prompts (List[str]): The other attributes that are irrelevant to the positive prompt. a list of strings, each string is a single prompt
+        """
+        # cond = self.mix_cond(neutral_prompt=neutral_prompt, positive_prompt=prompt, neg_prompt=neg_prompt)
+        pos_image = self.preprocess_image(positive_image)
+        neg_image = self.preprocess_image(negative_image)
+        neutral_image = self.preprocess_image(neutral_image)
+        cond = self.mix_cond(pos_image, neg_image, neutral_image)
+        coords = self.voxelize(mesh)
+        coords = torch.cat([
+            torch.arange(num_samples).repeat_interleave(coords.shape[0], 0)[:, None].int().cuda(),
+            coords.repeat(num_samples, 1)
+        ], 1)
+        torch.manual_seed(seed)
+        slat = self.sample_slat(cond, coords, slat_sampler_params, slider_scale)
+        return self.decode_slat(slat, formats)

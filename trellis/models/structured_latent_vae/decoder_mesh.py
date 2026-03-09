@@ -123,6 +123,12 @@ class SLatMeshDecoder(SparseTransformerBase):
         if use_fp16:
             self.convert_to_fp16()
 
+    def to(self, *args, **kwargs):
+        ret = super().to(*args, **kwargs)
+        device = next(self.parameters()).device
+        self.mesh_extractor.to(device)
+        return ret
+
     def initialize_weights(self) -> None:
         super().initialize_weights()
         # Zero-out output layers:
